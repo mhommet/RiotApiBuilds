@@ -8,11 +8,17 @@ from datetime import datetime, timedelta
 from typing import Optional
 import os
 
-from app.database import init_db, AsyncSessionLocal
+from app.database import (
+    init_db,
+    AsyncSessionLocal,
+    get_current_patch,
+    get_previous_patch
+)
 from app.riot_api import RiotAPI
 from app.background_worker import worker
 from app.tier_list_worker import tier_list_worker
 from app.analyzer import analyzer
+from app.weights import MIN_GAMES_THRESHOLD
 
 # Configure logging
 logging.basicConfig(
@@ -97,54 +103,99 @@ async def health():
 async def get_build(
     champion: str,
     role: str,
-    rank: str = Query("MASTER", enum=["MASTER", "GRANDMASTER", "CHALLENGER"]),
-    force_refresh: bool = Query(False, description="Force refresh from API")
+    force_refresh: bool = Query(False, description="Force collection and refresh from API")
 ):
     """
     Get optimal build for a champion/role combination.
 
-    Returns cached data if available (< 24h), otherwise returns 404
-    with a message to retry later.
+    Automatically aggregates data from Diamond+ ranks (Diamond, Master,
+    Grandmaster, Challenger) with weighted statistics.
+
+    Returns cached aggregated data if available (< 24h), otherwise
+    triggers collection and returns 404 with status.
     """
     champion_lower = champion.lower()
     role_lower = role.lower()
 
-    logger.info(f"Fetching build: {champion_lower} {role_lower} {rank}")
+    logger.info(f"Fetching aggregated build: {champion_lower} {role_lower}")
 
-    # Check cache in DB
+    # Force refresh: trigger collection
+    if force_refresh:
+        logger.info(f"Force refresh requested for {champion_lower} {role_lower}")
+        asyncio.create_task(worker.collect_games_for_champion(champion_lower, role_lower))
+
+    # Check cache in DB (look for AGGREGATED rank which is the new format)
     try:
         async with AsyncSessionLocal() as db:
             result = await db.execute(
                 text("""
-                    SELECT data, timestamp, games_analyzed, winrate
+                    SELECT
+                        data, timestamp, games_analyzed, winrate,
+                        total_games_analyzed, games_by_rank, recent_games,
+                        oldest_game_date, current_patch, data_quality_score,
+                        weighted_winrate, weighted_pickrate
                     FROM builds
-                    WHERE champion = :champion AND role = :role AND rank = :rank
-                    ORDER BY timestamp DESC
+                    WHERE champion = :champion AND role = :role
+                      AND (rank = 'AGGREGATED' OR rank = 'MASTER')
+                    ORDER BY
+                        CASE WHEN rank = 'AGGREGATED' THEN 0 ELSE 1 END,
+                        timestamp DESC
                     LIMIT 1
                 """),
-                {"champion": champion_lower, "role": role_lower, "rank": rank}
+                {"champion": champion_lower, "role": role_lower}
             )
             row = result.fetchone()
 
             if row and not force_refresh:
-                build_data, timestamp, games, winrate = row
+                (build_data, timestamp, games, winrate,
+                 total_games, games_by_rank, recent_games,
+                 oldest_game, current_patch, quality_score,
+                 weighted_winrate, weighted_pickrate) = row
+
                 age = datetime.utcnow() - timestamp
 
                 if age < timedelta(hours=24):
                     logger.info(f"Cache hit: {champion_lower} {role_lower} (age: {age})")
-                    return {
+
+                    response = {
                         "champion": champion,
                         "role": role,
-                        "rank": rank,
                         "build": build_data,
                         "cached": True,
                         "cache_age_hours": round(age.total_seconds() / 3600, 2),
-                        "games_analyzed": games,
-                        "winrate": winrate
+                        # Legacy fields
+                        "games_analyzed": games or total_games or 0,
+                        "winrate": winrate,
+                        # New metrics
+                        "total_games_analyzed": total_games or games or 0,
+                        "games_by_rank": games_by_rank or {"CHALLENGER": 0, "GRANDMASTER": 0, "MASTER": 0, "DIAMOND": 0},
+                        "recent_games": recent_games or 0,
+                        "oldest_game_date": oldest_game.isoformat() if oldest_game else None,
+                        "current_patch": current_patch,
+                        "data_quality_score": quality_score or 0,
+                        "weighted_winrate": weighted_winrate or winrate or 0,
+                        "weighted_pickrate": weighted_pickrate or 0
                     }
+
+                    return response
 
     except Exception as e:
         logger.error(f"Database error: {e}")
+
+    # Check if we have any games at all
+    game_count = 0
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                text("""
+                    SELECT COUNT(*) FROM game_records
+                    WHERE champion = :champion AND role = :role
+                """),
+                {"champion": champion_lower, "role": role_lower}
+            )
+            game_count = result.scalar() or 0
+    except Exception:
+        pass
 
     # No valid cache found
     raise HTTPException(
@@ -152,6 +203,8 @@ async def get_build(
         detail={
             "message": f"Build for {champion} {role} not found in cache",
             "suggestion": "The build is being generated. Please try again in a few minutes.",
+            "games_in_queue": game_count,
+            "min_games_required": MIN_GAMES_THRESHOLD,
             "worker_status": worker.get_status()
         }
     )
@@ -198,7 +251,7 @@ async def get_worker_stats():
     Get detailed worker status.
 
     Returns information about build generation progress,
-    tier list generation, and overall system health.
+    tier list generation, game collection stats, and overall system health.
     """
     build_worker_status = worker.get_status()
     tier_worker_status = tier_list_worker.get_status()
@@ -226,6 +279,33 @@ async def get_worker_stats():
             # Count tier list entries
             result = await db.execute(text("SELECT COUNT(*) FROM tier_list"))
             db_stats["tier_list_entries"] = result.scalar()
+
+            # Game records stats (new)
+            result = await db.execute(text("SELECT COUNT(*) FROM game_records"))
+            db_stats["total_games_stored"] = result.scalar()
+
+            # Games by rank
+            result = await db.execute(
+                text("""
+                    SELECT rank, COUNT(*) as count
+                    FROM game_records
+                    GROUP BY rank
+                """)
+            )
+            db_stats["games_by_rank"] = {row[0]: row[1] for row in result.fetchall()}
+
+            # Recent games (7 days)
+            result = await db.execute(
+                text("SELECT COUNT(*) FROM game_records WHERE game_date > NOW() - INTERVAL '7 days'")
+            )
+            db_stats["recent_games_7d"] = result.scalar()
+
+            # Patch info
+            result = await db.execute(
+                text("SELECT patch_version FROM patch_info WHERE is_current = TRUE LIMIT 1")
+            )
+            row = result.fetchone()
+            db_stats["current_patch"] = row[0] if row else None
 
     except Exception as e:
         logger.error(f"Error fetching DB stats: {e}")
@@ -292,12 +372,10 @@ async def list_champions():
 
 
 @app.get("/api/v1/champion/{champion}")
-async def get_champion_all_roles(
-    champion: str,
-    rank: str = Query("MASTER", enum=["MASTER", "GRANDMASTER", "CHALLENGER"])
-):
+async def get_champion_all_roles(champion: str):
     """
     Get builds for all roles for a specific champion.
+    Uses aggregated Diamond+ data.
     """
     champion_lower = champion.lower()
 
@@ -305,13 +383,18 @@ async def get_champion_all_roles(
         async with AsyncSessionLocal() as db:
             result = await db.execute(
                 text("""
-                    SELECT role, data, timestamp, games_analyzed, winrate
+                    SELECT DISTINCT ON (role)
+                        role, data, timestamp, games_analyzed, winrate,
+                        total_games_analyzed, games_by_rank, data_quality_score,
+                        weighted_winrate, current_patch
                     FROM builds
-                    WHERE champion = :champion AND rank = :rank
+                    WHERE champion = :champion
                       AND timestamp > NOW() - INTERVAL '48 hours'
-                    ORDER BY role
+                    ORDER BY role,
+                        CASE WHEN rank = 'AGGREGATED' THEN 0 ELSE 1 END,
+                        timestamp DESC
                 """),
-                {"champion": champion_lower, "rank": rank}
+                {"champion": champion_lower}
             )
             rows = result.fetchall()
 
@@ -328,12 +411,16 @@ async def get_champion_all_roles(
                     "build": row[1],
                     "timestamp": row[2].isoformat() if row[2] else None,
                     "games_analyzed": row[3],
-                    "winrate": row[4]
+                    "winrate": row[4],
+                    "total_games_analyzed": row[5] or row[3],
+                    "games_by_rank": row[6] or {},
+                    "data_quality_score": row[7] or 0,
+                    "weighted_winrate": row[8] or row[4],
+                    "current_patch": row[9]
                 }
 
             return {
                 "champion": champion,
-                "rank": rank,
                 "roles": builds
             }
 

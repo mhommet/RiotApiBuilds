@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:15-alpine
-    container_name: league_db
+    container_name: focus_db
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${DB_USER}
@@ -21,7 +21,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: league_backend
+    container_name: focus_backend
     restart: unless-stopped
     depends_on:
       postgres:
@@ -32,6 +32,7 @@ services:
       - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
     volumes:
       - ./backend/app:/app/app  # Hot reload en dev
+      - ./backend/scripts:/app/scripts  # Accès aux scripts de gestion
     ports:
       - "8000:8000"
     networks:

@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown"""
     # Startup
-    logger.info("Starting League Builds API...")
+    logger.info("Starting FocusAPI...")
     await init_db()
 
     # Launch background workers
@@ -53,7 +53,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="League Builds API",
+    title="FocusAPI",
     description="API for optimal League of Legends builds based on high elo player analysis",
     version="1.0.0",
     lifespan=lifespan
@@ -80,15 +80,23 @@ riot_api = RiotAPI(
 async def root():
     """Root endpoint with API info"""
     return {
-        "name": "League Builds API",
-        "version": "1.0.0",
+        "name": "FocusAPI",
+        "version": "1.1.0",
         "status": "operational",
         "docs": "/docs",
         "endpoints": {
             "build": "/api/v1/build/{champion}/{role}",
-            "tierlist": "/api/v1/tierlist",
+            "builds_all_roles": "/api/v1/builds/{champion}",
+            "champion_all_roles": "/api/v1/champion/{champion}",
+            "tierlist": "/api/v1/tierlist?role=mid",
+            "tierlist_flat": "/api/v1/tierlist/flat?role=mid",
+            "champions": "/api/v1/champions",
             "worker_status": "/api/v1/stats/worker",
             "health": "/health"
+        },
+        "features": {
+            "multi_role_support": True,
+            "role_filtering": ["top", "jungle", "mid", "adc", "support"]
         }
     }
 
@@ -212,33 +220,92 @@ async def get_build(
 
 @app.get("/api/v1/tierlist")
 async def get_tierlist(
-    rank: str = Query("MASTER", enum=["MASTER", "GRANDMASTER", "CHALLENGER"])
+    rank: str = Query("MASTER", enum=["MASTER", "GRANDMASTER", "CHALLENGER"]),
+    role: Optional[str] = Query(None, enum=["top", "jungle", "mid", "adc", "support"])
 ):
     """
     Get the current tier list.
 
     Returns champions grouped by tier (S, A, B, C, D) based on
     winrate and pickrate analysis.
+
+    Each champion can appear MULTIPLE TIMES (once per role) with different stats.
+    For example: Akali mid (S tier, 54% WR) and Akali top (B tier, 48% WR).
+
+    Args:
+        rank: Elo rank to filter by (MASTER, GRANDMASTER, CHALLENGER)
+        role: Optional role filter (top, jungle, mid, adc, support)
+              If not specified, returns all roles
     """
-    logger.info(f"Fetching tier list for {rank}")
+    logger.info(f"Fetching tier list for {rank}" + (f" role={role}" if role else ""))
 
     try:
-        tier_list = await tier_list_worker.get_tier_list(rank)
+        tier_list = await tier_list_worker.get_tier_list(rank, role)
 
-        # Count champions in each tier
-        counts = {tier: len(champs) for tier, champs in tier_list.items()}
+        # Count entries in each tier (now champion+role combos, not just champions)
+        counts = {tier: len(entries) for tier, entries in tier_list.items()}
         total = sum(counts.values())
 
-        return {
+        response = {
             "rank": rank,
             "tier_list": tier_list,
             "counts": counts,
-            "total_champions": total,
+            "total_entries": total,
+            "last_update": tier_list_worker.last_generation.isoformat() if tier_list_worker.last_generation else None
+        }
+
+        if role:
+            response["role_filter"] = role
+
+        return response
+
+    except Exception as e:
+        logger.error(f"Error fetching tier list: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={"message": "Error fetching tier list", "error": str(e)}
+        )
+
+
+@app.get("/api/v1/tierlist/flat")
+async def get_tierlist_flat(
+    rank: str = Query("MASTER", enum=["MASTER", "GRANDMASTER", "CHALLENGER"]),
+    role: Optional[str] = Query(None, enum=["top", "jungle", "mid", "adc", "support"])
+):
+    """
+    Get the tier list as a flat array (useful for frontend display).
+
+    Returns a flat list of champion+role entries sorted by performance score.
+    Each entry includes: champion, role, tier, winrate, pickrate, games_analyzed, performance_score.
+
+    Args:
+        rank: Elo rank to filter by
+        role: Optional role filter (top, jungle, mid, adc, support)
+    """
+    logger.info(f"Fetching flat tier list for {rank}" + (f" role={role}" if role else ""))
+
+    try:
+        tier_list = await tier_list_worker.get_tier_list(rank, role)
+
+        # Flatten the tier list into a single array sorted by performance_score
+        flat_list = []
+        for tier, entries in tier_list.items():
+            for entry in entries:
+                flat_list.append(entry)
+
+        # Sort by performance_score descending
+        flat_list.sort(key=lambda x: x["performance_score"], reverse=True)
+
+        return {
+            "rank": rank,
+            "role_filter": role,
+            "entries": flat_list,
+            "total_entries": len(flat_list),
             "last_update": tier_list_worker.last_generation.isoformat() if tier_list_worker.last_generation else None
         }
 
     except Exception as e:
-        logger.error(f"Error fetching tier list: {e}")
+        logger.error(f"Error fetching flat tier list: {e}")
         raise HTTPException(
             status_code=500,
             detail={"message": "Error fetching tier list", "error": str(e)}
@@ -371,11 +438,115 @@ async def list_champions():
         )
 
 
+@app.get("/api/v1/builds/{champion}")
+async def get_builds_all_roles(champion: str):
+    """
+    Get all builds for a champion across all roles.
+
+    Returns builds for each role the champion is played in, with tier information
+    and the primary_role (most played role).
+
+    Format:
+    {
+        "champion": "akali",
+        "primary_role": "mid",
+        "roles": [
+            {"role": "mid", "tier": "A", "winrate": 52.3, ...},
+            {"role": "top", "tier": "B", "winrate": 48.7, ...}
+        ]
+    }
+    """
+    champion_lower = champion.lower()
+
+    try:
+        async with AsyncSessionLocal() as db:
+            # Get builds with tier info from tier_list
+            result = await db.execute(
+                text("""
+                    SELECT DISTINCT ON (b.role)
+                        b.role, b.data, b.timestamp, b.games_analyzed, b.winrate,
+                        b.total_games_analyzed, b.games_by_rank, b.data_quality_score,
+                        b.weighted_winrate, b.current_patch,
+                        t.tier, t.pickrate, t.performance_score
+                    FROM builds b
+                    LEFT JOIN tier_list t ON b.champion = t.champion AND b.role = t.role
+                    WHERE b.champion = :champion
+                      AND b.timestamp > NOW() - INTERVAL '48 hours'
+                    ORDER BY b.role,
+                        CASE WHEN b.rank = 'AGGREGATED' THEN 0 ELSE 1 END,
+                        b.timestamp DESC
+                """),
+                {"champion": champion_lower}
+            )
+            rows = result.fetchall()
+
+            if not rows:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No builds found for {champion}"
+                )
+
+            roles_data = []
+            max_games = 0
+            primary_role = None
+
+            for row in rows:
+                role = row[0]
+                games = row[3] or row[5] or 0
+
+                # Track primary role (most games)
+                if games > max_games:
+                    max_games = games
+                    primary_role = role
+
+                roles_data.append({
+                    "role": role,
+                    "tier": row[10] or "?",  # tier from tier_list
+                    "winrate": round(float(row[4]), 2) if row[4] else 0,
+                    "pickrate": round(float(row[11]), 2) if row[11] else 0,
+                    "games_analyzed": games,
+                    "performance_score": round(float(row[12]), 2) if row[12] else 0,
+                    "build": row[1],  # Full build data
+                    "data_quality_score": row[7] or 0,
+                    "current_patch": row[9]
+                })
+
+            # Sort by games_analyzed (primary role first)
+            roles_data.sort(key=lambda x: x["games_analyzed"], reverse=True)
+
+            return {
+                "champion": champion,
+                "primary_role": primary_role,
+                "roles_count": len(roles_data),
+                "roles": roles_data
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching builds for {champion}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={"message": f"Error fetching builds for {champion}", "error": str(e)}
+        )
+
+
+@app.get("/api/v1/builds/{champion}/{role}")
+async def get_build_for_role(champion: str, role: str):
+    """
+    Get build for a specific champion and role.
+    Alias for /api/v1/build/{champion}/{role} for consistency.
+    """
+    return await get_build(champion, role)
+
+
 @app.get("/api/v1/champion/{champion}")
 async def get_champion_all_roles(champion: str):
     """
     Get builds for all roles for a specific champion.
     Uses aggregated Diamond+ data.
+
+    DEPRECATED: Use /api/v1/builds/{champion} instead for tier and primary_role info.
     """
     champion_lower = champion.lower()
 

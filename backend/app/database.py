@@ -104,11 +104,12 @@ async def init_db():
             )
         """))
 
-        # Create tier_list table
+        # Create tier_list table (with role support for multi-role champions)
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS tier_list (
                 id SERIAL PRIMARY KEY,
                 champion VARCHAR(50) NOT NULL,
+                role VARCHAR(20) NOT NULL,
                 tier VARCHAR(2) NOT NULL,
                 rank VARCHAR(20) NOT NULL,
                 winrate FLOAT,
@@ -118,6 +119,14 @@ async def init_db():
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
+
+        # Add role column to existing tier_list table if it doesn't exist
+        try:
+            await conn.execute(text("""
+                ALTER TABLE tier_list ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'unknown'
+            """))
+        except Exception:
+            pass  # Column might already exist
 
         # Create worker_stats table for tracking progress
         await conn.execute(text("""
@@ -163,10 +172,22 @@ async def init_db():
             ON tier_list(rank, timestamp DESC)
         """))
 
-        # Index pour tier_list par champion
+        # Index pour tier_list par champion et role
         await conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_tier_list_champion
             ON tier_list(champion, rank)
+        """))
+
+        # Index pour tier_list par role (pour filtrage par lane)
+        await conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_tier_list_role
+            ON tier_list(role, rank, performance_score DESC)
+        """))
+
+        # Index pour tier_list champion + role (pour requêtes multi-rôles)
+        await conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_tier_list_champion_role
+            ON tier_list(champion, role, rank)
         """))
 
     logger.info("Database tables initialized")

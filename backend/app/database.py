@@ -116,6 +116,7 @@ async def init_db():
                 pickrate FLOAT,
                 games_analyzed INTEGER,
                 performance_score FLOAT,
+                rank_in_role INTEGER,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
@@ -124,6 +125,14 @@ async def init_db():
         try:
             await conn.execute(text("""
                 ALTER TABLE tier_list ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'unknown'
+            """))
+        except Exception:
+            pass  # Column might already exist
+
+        # Add rank_in_role column to existing tier_list table if it doesn't exist
+        try:
+            await conn.execute(text("""
+                ALTER TABLE tier_list ADD COLUMN IF NOT EXISTS rank_in_role INTEGER
             """))
         except Exception:
             pass  # Column might already exist

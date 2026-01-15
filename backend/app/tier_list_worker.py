@@ -119,40 +119,57 @@ class TierListWorker:
                         "performance_score": round(performance_score, 2)
                     })
 
-                # Sort by performance score
-                champion_roles.sort(key=lambda x: x["performance_score"], reverse=True)
+                # Group champions BY ROLE for independent ranking
+                # Each role gets its own tier distribution
+                champions_by_role: Dict[str, List[Dict]] = {role: [] for role in ROLES}
 
-                # Assign tiers based on percentiles
-                total = len(champion_roles)
+                for entry in champion_roles:
+                    role = entry["role"]
+                    if role in champions_by_role:
+                        champions_by_role[role].append(entry)
+
+                # Assign tiers WITHIN each role independently
                 tier_list = {"S": [], "A": [], "B": [], "C": [], "D": []}
+                total_entries = 0
 
-                for i, entry in enumerate(champion_roles):
-                    percentile = (i / total) * 100
+                for role in ROLES:
+                    role_entries = champions_by_role[role]
+                    if not role_entries:
+                        continue
 
-                    # S Tier: Top 10% AND (winrate > 52% OR pickrate > 5%)
-                    if percentile < 10 and (entry["winrate"] > 52 or entry["pickrate"] > 5):
-                        tier = "S"
-                    # A Tier: 10-25%
-                    elif percentile < 25:
-                        tier = "A"
-                    # B Tier: 25-50%
-                    elif percentile < 50:
-                        tier = "B"
-                    # C Tier: 50-75%
-                    elif percentile < 75:
-                        tier = "C"
-                    # D Tier: Bottom 25%
-                    else:
-                        tier = "D"
+                    # Sort this role by performance score
+                    role_entries.sort(key=lambda x: x["performance_score"], reverse=True)
+                    role_total = len(role_entries)
+                    total_entries += role_total
 
-                    entry["tier"] = tier
-                    tier_list[tier].append(entry)
+                    for rank_idx, entry in enumerate(role_entries):
+                        percentile = (rank_idx / role_total) * 100
 
-                self.champions_analyzed = total
+                        # S Tier: Top 10% of THIS ROLE (with quality threshold)
+                        if percentile < 10 and (entry["winrate"] > 52 or entry["pickrate"] > 5):
+                            tier = "S"
+                        # A Tier: 10-25% of THIS ROLE
+                        elif percentile < 25:
+                            tier = "A"
+                        # B Tier: 25-50% of THIS ROLE
+                        elif percentile < 50:
+                            tier = "B"
+                        # C Tier: 50-75% of THIS ROLE
+                        elif percentile < 75:
+                            tier = "C"
+                        # D Tier: Bottom 25% of THIS ROLE
+                        else:
+                            tier = "D"
+
+                        entry["tier"] = tier
+                        entry["rank_in_role"] = rank_idx + 1  # 1-indexed rank within role
+                        tier_list[tier].append(entry)
+
+                self.champions_analyzed = total_entries
                 logger.info(
-                    f"Tier list generated (per role): S={len(tier_list['S'])}, A={len(tier_list['A'])}, "
+                    f"Tier list generated (ranked PER ROLE): S={len(tier_list['S'])}, A={len(tier_list['A'])}, "
                     f"B={len(tier_list['B'])}, C={len(tier_list['C'])}, D={len(tier_list['D'])} "
-                    f"(total entries: {total})"
+                    f"(total entries: {total_entries})"
                 )
 
                 # Save tier list to database
@@ -185,8 +202,8 @@ class TierListWorker:
                     await db.execute(
                         text("""
                             INSERT INTO tier_list
-                            (champion, role, tier, rank, winrate, pickrate, games_analyzed, performance_score, timestamp)
-                            VALUES (:champion, :role, :tier, :rank, :winrate, :pickrate, :games, :score, :timestamp)
+                            (champion, role, tier, rank, winrate, pickrate, games_analyzed, performance_score, rank_in_role, timestamp)
+                            VALUES (:champion, :role, :tier, :rank, :winrate, :pickrate, :games, :score, :rank_in_role, :timestamp)
                         """),
                         {
                             "champion": entry["champion"],
@@ -197,6 +214,7 @@ class TierListWorker:
                             "pickrate": entry["pickrate"],
                             "games": entry["games_analyzed"],
                             "score": entry["performance_score"],
+                            "rank_in_role": entry.get("rank_in_role"),
                             "timestamp": timestamp
                         }
                     )
@@ -225,17 +243,17 @@ class TierListWorker:
                 # Build query based on role filter
                 if role:
                     query = text("""
-                        SELECT champion, role, tier, winrate, pickrate, games_analyzed, performance_score, timestamp
+                        SELECT champion, role, tier, winrate, pickrate, games_analyzed, performance_score, rank_in_role, timestamp
                         FROM tier_list
                         WHERE role = :role
-                        ORDER BY performance_score DESC
+                        ORDER BY rank_in_role ASC
                     """)
                     params = {"role": role.lower()}
                 else:
                     query = text("""
-                        SELECT champion, role, tier, winrate, pickrate, games_analyzed, performance_score, timestamp
+                        SELECT champion, role, tier, winrate, pickrate, games_analyzed, performance_score, rank_in_role, timestamp
                         FROM tier_list
-                        ORDER BY performance_score DESC
+                        ORDER BY role, rank_in_role ASC
                     """)
                     params = {}
 
@@ -266,7 +284,8 @@ class TierListWorker:
                             "winrate": float(row[3]) if row[3] else 0.0,
                             "pickrate": float(row[4]) if row[4] else 0.0,
                             "games_analyzed": int(row[5]) if row[5] else 0,
-                            "performance_score": float(row[6]) if row[6] else 0.0
+                            "performance_score": float(row[6]) if row[6] else 0.0,
+                            "rank_in_role": int(row[7]) if row[7] else None
                         })
 
                 return tier_list

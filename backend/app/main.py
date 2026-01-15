@@ -19,6 +19,7 @@ from app.background_worker import worker
 from app.tier_list_worker import tier_list_worker
 from app.analyzer import analyzer
 from app.weights import MIN_GAMES_THRESHOLD
+from app.item_data_manager import item_manager
 
 # Configure logging
 logging.basicConfig(
@@ -92,6 +93,9 @@ async def root():
             "tierlist_flat": "/api/v1/tierlist/flat?role=mid",
             "champions": "/api/v1/champions",
             "worker_status": "/api/v1/stats/worker",
+            "items": "/api/v1/items",
+            "item": "/api/v1/items/{item_id}",
+            "items_version": "/api/v1/items/version",
             "health": "/health"
         },
         "features": {
@@ -596,4 +600,132 @@ async def get_champion_all_roles(champion: str):
         raise HTTPException(
             status_code=500,
             detail={"message": f"Error fetching builds for {champion}", "error": str(e)}
+        )
+
+
+# ============================================================================
+# Item Data Dragon Endpoints
+# ============================================================================
+
+@app.get("/api/v1/items")
+async def get_all_items(
+    refresh: bool = Query(False, description="Force refresh from Data Dragon"),
+    tag: Optional[str] = Query(None, description="Filter by item tag (e.g., Boots, Damage, Health)"),
+    min_efficiency: Optional[float] = Query(None, description="Minimum gold efficiency filter")
+):
+    """
+    Get all items from Data Dragon with calculated gold efficiency.
+
+    Data is cached for 24 hours and refreshed automatically.
+    Each item includes:
+    - All standard Data Dragon fields
+    - gold_efficiency: Calculated efficiency percentage
+    - image_url: Direct URL to item image
+
+    Args:
+        refresh: Force refresh from Data Dragon (ignores cache)
+        tag: Filter items by tag (e.g., "Boots", "Damage", "Health")
+        min_efficiency: Only return items with efficiency >= this value
+    """
+    try:
+        # If filtering by tag
+        if tag:
+            items_list = await item_manager.get_items_by_tag(tag)
+            if min_efficiency is not None:
+                items_list = [
+                    item for item in items_list
+                    if item.get('gold_efficiency') is not None
+                    and item.get('gold_efficiency') >= min_efficiency
+                ]
+            return {
+                "success": True,
+                "version": await item_manager.get_version(),
+                "filter": {"tag": tag, "min_efficiency": min_efficiency},
+                "count": len(items_list),
+                "items": items_list
+            }
+
+        # If filtering by efficiency only
+        if min_efficiency is not None:
+            items_list = await item_manager.get_purchasable_items(min_efficiency=min_efficiency)
+            return {
+                "success": True,
+                "version": await item_manager.get_version(),
+                "filter": {"min_efficiency": min_efficiency},
+                "count": len(items_list),
+                "items": items_list
+            }
+
+        # Get all items
+        items_data = await item_manager.get_items(force_refresh=refresh)
+        return {
+            "success": True,
+            "version": await item_manager.get_version(),
+            "count": len(items_data.get('data', {})),
+            "items": items_data.get('data', {})
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching items: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={"success": False, "error": str(e)}
+        )
+
+
+@app.get("/api/v1/items/version")
+async def get_items_version():
+    """
+    Get the current Data Dragon version for items.
+
+    Returns the patch version used for item data (e.g., "16.1.1").
+    """
+    try:
+        # Ensure items are loaded to get version
+        await item_manager.get_items()
+        return {
+            "success": True,
+            "version": item_manager.version
+        }
+    except Exception as e:
+        logger.error(f"Error getting version: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={"success": False, "error": str(e)}
+        )
+
+
+@app.get("/api/v1/items/{item_id}")
+async def get_item(item_id: str):
+    """
+    Get a specific item by ID.
+
+    Args:
+        item_id: The Data Dragon item ID (e.g., "3031" for Infinity Edge)
+
+    Returns the item with gold efficiency calculated.
+    """
+    try:
+        item = await item_manager.get_item(item_id)
+
+        if not item:
+            raise HTTPException(
+                status_code=404,
+                detail={"success": False, "error": f"Item {item_id} not found"}
+            )
+
+        return {
+            "success": True,
+            "version": await item_manager.get_version(),
+            "item_id": item_id,
+            "item": item
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching item {item_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={"success": False, "error": str(e)}
         )

@@ -84,6 +84,75 @@ class BuildGeneratorWorker:
             # Fallback to a small list for testing
             return ["aatrox", "ahri", "akali", "yasuo", "yone", "zed", "jinx", "lux"]
 
+    async def get_prioritized_champions(self, all_champions: List[str]) -> List[str]:
+        """
+        Reorder champions to prioritize those without builds.
+
+        Priority order:
+        1. Champions with 0 builds (never processed)
+        2. Champions with builds older than 24 hours
+        3. Champions with recent builds
+
+        This ensures all champions get at least one build before
+        re-scanning those that already have data.
+        """
+        try:
+            async with AsyncSessionLocal() as db:
+                # Get champions that have recent builds (< 48h)
+                result = await db.execute(
+                    text("""
+                        SELECT DISTINCT champion
+                        FROM builds
+                        WHERE timestamp > NOW() - INTERVAL '48 hours'
+                    """)
+                )
+                champions_with_builds = {row[0] for row in result.fetchall()}
+
+                # Get champions with old builds (> 48h but exists)
+                result = await db.execute(
+                    text("""
+                        SELECT DISTINCT champion
+                        FROM builds
+                        WHERE champion NOT IN (
+                            SELECT DISTINCT champion
+                            FROM builds
+                            WHERE timestamp > NOW() - INTERVAL '48 hours'
+                        )
+                    """)
+                )
+                champions_with_old_builds = {row[0] for row in result.fetchall()}
+
+            # Categorize champions
+            no_builds = []
+            old_builds = []
+            recent_builds = []
+
+            for champion in all_champions:
+                if champion in champions_with_builds:
+                    recent_builds.append(champion)
+                elif champion in champions_with_old_builds:
+                    old_builds.append(champion)
+                else:
+                    no_builds.append(champion)
+
+            # Log priority stats
+            logger.info(f"=== CHAMPION PRIORITY QUEUE ===")
+            logger.info(f"Champions without builds: {len(no_builds)}")
+            logger.info(f"Champions with old builds (>48h): {len(old_builds)}")
+            logger.info(f"Champions with recent builds: {len(recent_builds)}")
+
+            if no_builds:
+                logger.info(f"Priority champions (no builds): {no_builds[:10]}{'...' if len(no_builds) > 10 else ''}")
+
+            # Return prioritized order: no builds → old builds → recent builds
+            prioritized = no_builds + old_builds + recent_builds
+            return prioritized
+
+        except Exception as e:
+            logger.error(f"Error prioritizing champions: {e}")
+            # Fallback to original order
+            return all_champions
+
     async def check_and_update_patch(self) -> bool:
         """Check for patch updates and return True if a new patch was detected"""
         try:
@@ -577,7 +646,8 @@ class BuildGeneratorWorker:
             "cycle_started_at": self.cycle_started_at.isoformat() if self.cycle_started_at else None,
             "last_update": self.last_update.isoformat() if self.last_update else None,
             "champions_loaded": len(self.champions),
-            "ranks_collected": ALL_RANKS
+            "ranks_collected": ALL_RANKS,
+            "priority_mode": "missing_first"
         }
 
     async def run(self):
@@ -613,10 +683,13 @@ class BuildGeneratorWorker:
                 logger.info("New patch detected - cleaning up old data")
                 await self.cleanup_old_games()
 
+            # Prioritize champions without builds (runs at each cycle start)
+            prioritized_champions = await self.get_prioritized_champions(self.champions)
+
             await self.update_worker_stats()
 
             processed = 0
-            for champion in self.champions:
+            for champion in prioritized_champions:
                 if not self.running:
                     break
 

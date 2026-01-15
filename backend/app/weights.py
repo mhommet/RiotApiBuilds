@@ -14,7 +14,7 @@ RANK_WEIGHTS = {
 ALL_RANKS = ["CHALLENGER", "GRANDMASTER", "MASTER", "DIAMOND"]
 
 # Seuils de données
-MIN_GAMES_THRESHOLD = 30      # Minimum de parties pour considérer les données fiables
+MIN_GAMES_THRESHOLD = 15      # Minimum de parties pour considérer les données fiables
 IDEAL_GAMES_TARGET = 100      # Objectif idéal de parties pour un score de qualité maximal
 MAX_GAMES_PER_RANK = 50       # Limite de parties stockées par rank pour éviter le biais
 
@@ -23,7 +23,7 @@ CACHE_DURATION_HOURS = 24     # Durée du cache des builds agrégés
 REFRESH_INTERVAL_DAYS = 7     # Intervalle maximum sans nouvelle collecte
 
 # Nombre de joueurs à interroger par rank
-PLAYERS_PER_RANK = 10         # Augmenté de 5 à 10 pour plus de données
+PLAYERS_PER_RANK = 25         # Augmenté pour collecter plus de données
 
 
 def get_age_weight(days_old: int, is_previous_patch: bool = False) -> float:

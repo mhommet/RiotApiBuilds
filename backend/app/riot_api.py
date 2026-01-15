@@ -161,17 +161,37 @@ class RiotAPI:
             if rank == "DIAMOND":
                 # Diamond uses a different endpoint structure
                 entries = await self._get_diamond_players(session)
-                # Diamond entries have different structure, need to get PUUID
+
+                # Diamond entries need PUUID lookup (unlike Challenger/GM/Master)
                 entries_with_puuid = []
-                for entry in entries[:100]:  # Limit to 100 to reduce API calls
+                puuid_fetch_failed = 0
+
+                for i, entry in enumerate(entries[:100]):  # Limit to 100 to reduce API calls
+                    # Check if puuid already exists (newer API versions may include it)
+                    if entry.get("puuid"):
+                        entries_with_puuid.append(entry)
+                        continue
+
                     summoner_id = entry.get("summonerId")
                     if summoner_id:
                         # Get PUUID from summoner ID
                         summoner_url = f"{self.base_url}/lol/summoner/v4/summoners/{summoner_id}"
                         summoner_data = await self._request(summoner_url, session)
+
                         if summoner_data and "puuid" in summoner_data:
                             entry["puuid"] = summoner_data["puuid"]
                             entries_with_puuid.append(entry)
+                        else:
+                            puuid_fetch_failed += 1
+
+                        # Add small delay every 10 requests to avoid rate limiting
+                        if (i + 1) % 10 == 0:
+                            await asyncio.sleep(0.5)
+
+                if puuid_fetch_failed > 0:
+                    logger.warning(f"Failed to fetch PUUID for {puuid_fetch_failed} Diamond players (rate limit or API error)")
+
+                logger.info(f"Diamond players with PUUID: {len(entries_with_puuid)}/{len(entries[:100])}")
                 entries = entries_with_puuid
             else:
                 # Challenger, Grandmaster, Master use league endpoints
@@ -210,8 +230,8 @@ class RiotAPI:
                 mastery_url = f"{self.base_url}/lol/champion-mastery/v4/champion-masteries/by-puuid/{puuid}/by-champion/{champion_id}"
                 mastery = await self._request(mastery_url, session)
 
-                if not mastery or mastery.get("championPoints", 0) < 30000:
-                    continue  # Skip if less than 30k mastery
+                if not mastery or mastery.get("championPoints", 0) < 15000:
+                    continue  # Skip if less than 15k mastery
 
                 players_with_mastery += 1
                 logger.info(f"Found player with {mastery.get('championPoints', 0):,} mastery on {champion}")

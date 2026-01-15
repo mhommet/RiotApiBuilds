@@ -33,9 +33,9 @@ class TierListWorker:
             "champions_analyzed": self.champions_analyzed
         }
 
-    async def generate_tier_list(self, rank: str = "MASTER") -> Dict[str, List[Dict]]:
+    async def generate_tier_list(self) -> Dict[str, List[Dict]]:
         """
-        Generate tier list based on recent builds.
+        Generate tier list based on recent aggregated builds (Diamond+ data).
 
         Each champion can appear MULTIPLE TIMES (once per role) with different tiers.
         For example: Akali mid (S tier) and Akali top (B tier).
@@ -47,12 +47,13 @@ class TierListWorker:
         - C Tier: 50-75%
         - D Tier: Bottom 25%
         """
-        self.current_status = f"generating tier list for {rank}"
-        logger.info(f"Generating tier list for {rank}...")
+        self.current_status = "generating tier list"
+        logger.info("Generating tier list from aggregated data...")
 
         try:
             async with AsyncSessionLocal() as db:
                 # Get all recent builds grouped by (champion, role) - each combo is a separate entry
+                # Uses AGGREGATED builds which combine all ranks (Diamond+)
                 result = await db.execute(
                     text("""
                         WITH recent_builds AS (
@@ -67,7 +68,7 @@ class TierListWorker:
                                     ORDER BY timestamp DESC
                                 ) as rn
                             FROM builds
-                            WHERE rank = :rank
+                            WHERE rank = 'AGGREGATED'
                               AND timestamp > NOW() - INTERVAL '48 hours'
                         )
                         SELECT
@@ -81,7 +82,7 @@ class TierListWorker:
                           AND role IN ('top', 'jungle', 'mid', 'adc', 'support')
                         ORDER BY winrate DESC
                     """),
-                    {"rank": rank, "min_games": MIN_GAMES_FOR_TIER}
+                    {"min_games": MIN_GAMES_FOR_TIER}
                 )
 
                 rows = result.fetchall()
@@ -155,7 +156,7 @@ class TierListWorker:
                 )
 
                 # Save tier list to database
-                await self._save_tier_list(db, tier_list, rank)
+                await self._save_tier_list(db, tier_list)
 
                 return tier_list
 
@@ -169,18 +170,14 @@ class TierListWorker:
     async def _save_tier_list(
         self,
         db,
-        tier_list: Dict[str, List[Dict]],
-        rank: str
+        tier_list: Dict[str, List[Dict]]
     ):
         """Save tier list to database (with role support)"""
         try:
             timestamp = datetime.utcnow()
 
-            # Delete old tier list entries for this rank
-            await db.execute(
-                text("DELETE FROM tier_list WHERE rank = :rank"),
-                {"rank": rank}
-            )
+            # Delete all old tier list entries
+            await db.execute(text("DELETE FROM tier_list"))
 
             # Insert new tier list entries (one per champion+role combo)
             for tier, entries in tier_list.items():
@@ -195,7 +192,7 @@ class TierListWorker:
                             "champion": entry["champion"],
                             "role": entry["role"],
                             "tier": tier,
-                            "rank": rank,
+                            "rank": "AGGREGATED",
                             "winrate": entry["winrate"],
                             "pickrate": entry["pickrate"],
                             "games": entry["games_analyzed"],
@@ -214,14 +211,12 @@ class TierListWorker:
 
     async def get_tier_list(
         self,
-        rank: str = "MASTER",
         role: Optional[str] = None
     ) -> Dict[str, List[Dict]]:
         """
         Get the current tier list from database.
 
         Args:
-            rank: Elo rank (MASTER, GRANDMASTER, CHALLENGER)
             role: Optional role filter (top, jungle, mid, adc, support)
                   If None, returns all roles
         """
@@ -232,25 +227,24 @@ class TierListWorker:
                     query = text("""
                         SELECT champion, role, tier, winrate, pickrate, games_analyzed, performance_score, timestamp
                         FROM tier_list
-                        WHERE rank = :rank AND role = :role
+                        WHERE role = :role
                         ORDER BY performance_score DESC
                     """)
-                    params = {"rank": rank, "role": role.lower()}
+                    params = {"role": role.lower()}
                 else:
                     query = text("""
                         SELECT champion, role, tier, winrate, pickrate, games_analyzed, performance_score, timestamp
                         FROM tier_list
-                        WHERE rank = :rank
                         ORDER BY performance_score DESC
                     """)
-                    params = {"rank": rank}
+                    params = {}
 
                 result = await db.execute(query, params)
                 rows = result.fetchall()
 
                 if not rows:
                     # Try to generate if empty
-                    tier_list = await self.generate_tier_list(rank)
+                    tier_list = await self.generate_tier_list()
                     # If role filter was requested, filter the results
                     if role:
                         role_lower = role.lower()
@@ -293,9 +287,8 @@ class TierListWorker:
             try:
                 self.current_status = "running"
 
-                # Generate tier list for each rank
-                for rank in ["MASTER"]:
-                    await self.generate_tier_list(rank)
+                # Generate tier list from aggregated data
+                await self.generate_tier_list()
 
                 self.last_generation = datetime.utcnow()
                 self.current_status = "idle"

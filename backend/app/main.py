@@ -220,34 +220,31 @@ async def get_build(
 
 @app.get("/api/v1/tierlist")
 async def get_tierlist(
-    rank: str = Query("MASTER", enum=["MASTER", "GRANDMASTER", "CHALLENGER"]),
     role: Optional[str] = Query(None, enum=["top", "jungle", "mid", "adc", "support"])
 ):
     """
     Get the current tier list.
 
     Returns champions grouped by tier (S, A, B, C, D) based on
-    winrate and pickrate analysis.
+    winrate and pickrate analysis from Diamond+ players (aggregated data).
 
     Each champion can appear MULTIPLE TIMES (once per role) with different stats.
     For example: Akali mid (S tier, 54% WR) and Akali top (B tier, 48% WR).
 
     Args:
-        rank: Elo rank to filter by (MASTER, GRANDMASTER, CHALLENGER)
         role: Optional role filter (top, jungle, mid, adc, support)
               If not specified, returns all roles
     """
-    logger.info(f"Fetching tier list for {rank}" + (f" role={role}" if role else ""))
+    logger.info(f"Fetching tier list" + (f" role={role}" if role else ""))
 
     try:
-        tier_list = await tier_list_worker.get_tier_list(rank, role)
+        tier_list = await tier_list_worker.get_tier_list(role)
 
         # Count entries in each tier (now champion+role combos, not just champions)
         counts = {tier: len(entries) for tier, entries in tier_list.items()}
         total = sum(counts.values())
 
         response = {
-            "rank": rank,
             "tier_list": tier_list,
             "counts": counts,
             "total_entries": total,
@@ -269,7 +266,6 @@ async def get_tierlist(
 
 @app.get("/api/v1/tierlist/flat")
 async def get_tierlist_flat(
-    rank: str = Query("MASTER", enum=["MASTER", "GRANDMASTER", "CHALLENGER"]),
     role: Optional[str] = Query(None, enum=["top", "jungle", "mid", "adc", "support"])
 ):
     """
@@ -279,13 +275,12 @@ async def get_tierlist_flat(
     Each entry includes: champion, role, tier, winrate, pickrate, games_analyzed, performance_score.
 
     Args:
-        rank: Elo rank to filter by
         role: Optional role filter (top, jungle, mid, adc, support)
     """
-    logger.info(f"Fetching flat tier list for {rank}" + (f" role={role}" if role else ""))
+    logger.info(f"Fetching flat tier list" + (f" role={role}" if role else ""))
 
     try:
-        tier_list = await tier_list_worker.get_tier_list(rank, role)
+        tier_list = await tier_list_worker.get_tier_list(role)
 
         # Flatten the tier list into a single array sorted by performance_score
         flat_list = []
@@ -297,7 +292,6 @@ async def get_tierlist_flat(
         flat_list.sort(key=lambda x: x["performance_score"], reverse=True)
 
         return {
-            "rank": rank,
             "role_filter": role,
             "entries": flat_list,
             "total_entries": len(flat_list),
